@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments and local editor state
+.venv/
+.Rproj.user/
+.DS_Store
+
+# Local data and generated artifacts
+read/**
+checkpoints/**
+write/**
+
+# Keep the directory structure visible in git
+!read/
+!read/.gitkeep
+!checkpoints/
+!checkpoints/.gitkeep
+!write/
+!write/figures/
+!write/tables/
+!write/figures/.gitkeep
+!write/tables/.gitkeep

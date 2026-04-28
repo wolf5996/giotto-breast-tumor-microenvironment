@@ -1,0 +1,19 @@
+[project]
+name = "giotto-env-breast"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10.2"
+dependencies = [
+    "imagecodecs>=2025.3.30",
+    "leidenalg>=0.11.0",
+    "networkx>=3.4.2",
+    "pandas>=2.3.3",
+    "python-igraph>=1.0.0",
+    "python-louvain>=0.16",
+    "scikit-learn>=1.7.2",
+    "scrublet>=0.2.3",
+    "session-info>=1.0.1",
+    "smfishhmrf>=1.3.3",
+    "tiffile>=2018.10.18",
+]

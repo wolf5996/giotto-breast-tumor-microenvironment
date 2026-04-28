@@ -1,0 +1,392 @@
+---
+title: "04 — Joint Integration: scRNA-Seq × Xenium with Harmony"
+author: "Badran Elshenawy"
+date: today
+format:
+  html:
+    theme: darkly
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    self-contained: true
+    title-block-banner: true
+engine: knitr
+execute:
+  eval: false
+  warning: false
+  message: false
+---
+
+# Context
+
+- **Scope**: join the processed Xenium object (script `01`) with the annotated Giotto scRNA-Seq object (script `03`) into a single Giotto object, correct the technology-driven batch effect with Harmony, and transfer cell type labels from the scRNA-Seq cells onto the Xenium cells via kNN in the Harmony space
+- **Why integrate at all**: Xenium sees ~300 targeted genes; scRNA-Seq sees the transcriptome. Integrating on the shared features lets the Xenium cells inherit annotations learned from a transcriptome-wide view of the same tissue indication
+- **Integration anchor**: `vars_use = "list_ID"` — Harmony corrects for the dataset-of-origin variable (the one automatically added by `joinGiottoObjects`); no biological covariates are conditioned on
+- **Label transfer**: kNN-based (`labelTransfer`), k = 10, operating on the Harmony embedding — simple and deterministic given the embedding
+- **Upstream**:
+  - `../checkpoints/01-xenium-gobj/` (script 01)
+  - `../checkpoints/03-sc-giotto-annotated/` (script 03)
+- **Downstream**: `../checkpoints/04-joined-giotto-harmony-annotated/` — consumed by the advanced spatial-only analyses (`05-advanced-spatial.qmd`)
+
+## Checkpoint Convention
+
+| Stage | File | Description |
+|---|---|---|
+| Joined object (raw) | `../checkpoints/04-joined-giotto/` | After `joinGiottoObjects` on shared features |
+| After Harmony | `../checkpoints/04-joined-giotto-harmony/` | With PCA, pre-/post-Harmony UMAPs |
+| After label transfer | `../checkpoints/04-joined-giotto-harmony-annotated/` | Adds `trnsfr_celltype` on Xenium cells |
+
+# Setup
+
+```{r}
+#| label: setup-giotto
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+python_path <- ".venv/bin/python"
+set_giotto_python_path(python_path = python_path)
+
+results_folder <- "../write/figures/"
+
+instrs <- createGiottoInstructions(
+    save_dir = results_folder,
+    save_plot = TRUE,
+    show_plot = FALSE,
+    return_plot = FALSE,
+    python_path = python_path
+)
+
+# Dimensionality budget for the joint workspace — used for PCA, Harmony, UMAP,
+# and label transfer so the subspace is consistent across steps.
+ndims <- 10
+```
+
+# Load Input Checkpoints
+
+- **`loadGiotto(..., reconnect_giottoImage = TRUE)`** on the Xenium object — re-hydrates pointers to the post-Xenium H&E and IF TIFFs in `read/tif_exports/`
+- **Images are not strictly needed** for the integration workflow below; reconnecting anyway keeps the loaded object identical in shape to what script 01 produced, which makes it safer to revert to if integration is reworked
+- **`python_path` passed to `loadGiotto`**: avoids Giotto defaulting back to its managed conda env on first Python dispatch after reload
+
+```{r}
+#| label: load-inputs
+
+# Libraries ----------
+library(Giotto)
+
+# Inputs ----------
+load_giotto_checkpoint <- function(folder_path, rds_path, reconnect_giottoImage) {
+    if (dir.exists(folder_path) && file.exists(file.path(folder_path, "gobject.RDS"))) {
+        return(loadGiotto(
+            path_to_folder = folder_path,
+            reconnect_giottoImage = reconnect_giottoImage,
+            python_path = python_path
+        ))
+    }
+
+    readRDS(rds_path)
+}
+
+xenium_gobj <- load_giotto_checkpoint(
+    folder_path = "../checkpoints/01-xenium-gobj",
+    rds_path = "../checkpoints/01-xenium-gobj.rds",
+    reconnect_giottoImage = TRUE
+)
+
+sc <- load_giotto_checkpoint(
+    folder_path = "../checkpoints/03-sc-giotto-annotated",
+    rds_path = "../checkpoints/03-sc-giotto-annotated.rds",
+    reconnect_giottoImage = FALSE
+)
+```
+
+# Feature Intersection and Object Stripping
+
+- **Feature intersection**: Xenium panels cover ~300 curated targets; scRNA-Seq covers the full transcriptome. The join is only defined over their shared features — typically the full Xenium panel (298 features in this sample) because the panel was designed from the transcriptome space
+- **Stripping down to core slots**: `joinGiottoObjects` joins on matching slot structures, so we rebuild each object with only the slots needed (`expression`, `spatial_locs`, plus `cell_metadata` on the sc side for the celltype label)
+- **`giotto() |> setGiotto(...)`**: empty shell + slot-by-slot injection — a safer pattern than passing the full objects, because the full Xenium object carries images, polygons, and transcript point clouds that the joined object has no business owning
+- **`spat_unit = "cell"`** on the Xenium slice: Xenium has multiple spatial units (`cell`, `nucleus`, etc.); only `cell` is used in the join
+
+```{r}
+#| label: feature-intersection-and-join
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+# Shared features — the join is only defined over these.
+ufids <- intersect(featIDs(xenium_gobj), featIDs(sc))
+cat("Shared features between sc and Xenium:", length(ufids), "\n")  # expect ~298
+
+# Pull sc cell metadata out before stripping — we want to carry `celltype` through.
+sc_meta <- pDataDT(sc)
+
+# Build a minimal sc object carrying only expression + (empty) spatial locs +
+# the preserved metadata. Spatial locs are retained even though sc is dissociated
+# because joinGiottoObjects expects the slot to be present.
+sc_join <- giotto() |>
+    setGiotto(sc[[c("expression", "spatial_locs", "cell_metadata"), "raw"]])
+
+sc_join <- addCellMetadata(
+    sc_join,
+    new_metadata   = sc_meta,
+    by_column      = TRUE,
+    column_cell_ID = "cell_ID"
+)
+
+# Minimal xenium object — only expression + cell-level spatial coordinates.
+xen_join <- giotto() |>
+    setGiotto(xenium_gobj[[c("expression", "spatial_locs"), "raw", spat_unit = "cell"]])
+
+# Join on shared features. `list_ID` ("sc" / "xen") is auto-added by Giotto
+# and becomes the Harmony batch variable further down.
+j <- joinGiottoObjects(
+    list(sc_join[ufids], xen_join[ufids]),
+    gobject_names = c("sc", "xen")
+)
+
+# Restore the instructions so plotting in the joined object routes to the same
+# figures directory as all other scripts.
+instructions(j) <- instrs
+
+# Outputs ----------
+saveGiotto(
+    gobject = j,
+    dir = "../checkpoints",
+    foldername = "04-joined-giotto",
+    method = "saveRDS"
+)
+```
+
+# Filter, Normalise, and PCA on the Joined Object
+
+- **Re-filter after join**: filtering is re-applied because the joined object now mixes two technologies with different depth distributions; a unified filter reduces residual bias before Harmony sees the data
+  - `expression_threshold = 1` — detection at single-UMI
+  - `feat_det_in_min_cells = 1` — very lenient (we already intersected to the Xenium panel, and every gene there is by design a marker)
+  - `min_det_feats_per_cell = 10` — low floor; the Xenium cells contribute many fewer unique features per cell than scRNA-Seq
+- **Normalisation**: default `normalizeGiotto` (library-size + log) — Pearson residuals and quantile normalisation were tried and did not behave well across the two technologies
+- **`runPCA(feats_to_use = NULL)`**: all shared features enter the PCA — no HVF step because 298 panel genes are already lineage-informative by design
+- **Pre-Harmony PCA coloured by `list_ID`**: the expected look is two clearly separated clouds — that separation is exactly what Harmony is asked to collapse
+
+```{r}
+#| label: filter-normalise-pca-joined
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+j <- filterGiotto(
+    j,
+    expression_threshold = 1,
+    feat_det_in_min_cells = 1,
+    min_det_feats_per_cell = 10
+)
+
+j <- normalizeGiotto(j)
+
+j <- runPCA(j, feats_to_use = NULL)
+
+# PC1/PC2 coloured by dataset — visualises the technology-driven batch effect
+# before Harmony correction.
+plotPCA(
+    j,
+    cell_color = "list_ID",
+    point_border_stroke = 0,
+    point_size = 0.6,
+    save_param = list(
+        save_name = "04-joined-pca-list-id",
+        base_width = 8,
+        base_height = 6
+    )
+)
+
+screePlot(
+    j,
+    ncp = 50,
+    save_param = list(
+        save_name = "04-joined-scree-plot",
+        base_width = 7,
+        base_height = 5
+    )
+)
+```
+
+# Pre-Harmony UMAP
+
+- **Purpose**: snapshot of the embedding *before* batch correction — sc and xenium cells should form mostly disjoint blobs, which is the visual baseline against which Harmony is judged
+- **`cell_color_code = c("red", "blue")`**: deliberately high-contrast to emphasise the pre-correction separation
+
+```{r}
+#| label: umap-pre-harmony
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+j <- runUMAP(j, dimensions_to_use = seq(ndims))
+
+plotUMAP(
+    j,
+    cell_color = "list_ID",
+    point_size = 0.3,
+    point_border_stroke = 0,
+    cell_color_code = c("red", "blue"),
+    save_param = list(
+        save_name = "04-joined-umap-pre-harmony-list-id",
+        base_width = 8,
+        base_height = 6
+    )
+)
+```
+
+# Harmony Batch Correction
+
+- **Why Harmony**: fast, soft-cluster-based integration that works directly on a PCA embedding and produces a corrected low-dimensional space in one call — no reference projection or anchor-finding needed
+- **`vars_use = "list_ID"`**: correct only for dataset-of-origin; no biological covariate is conditioned on so that intrinsic population differences survive the correction
+- **Post-Harmony UMAP**: the two datasets should now interleave. Residual separation after correction suggests either (a) populations unique to one dataset, or (b) correction under-shot and may need tuning
+- **Two post-Harmony views are saved**:
+  1. Cells coloured by `list_ID` — the integration quality check
+  2. Only sc cells coloured by `celltype`, Xenium shown as low-contrast background — the reference overlay that the label transfer will draw from
+
+```{r}
+#| label: harmony
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+j <- runGiottoHarmony(
+    j,
+    vars_use = "list_ID",
+    dim_reduction_name = "pca",
+    dimensions_to_use = seq(ndims),
+    name = "harmony"
+)
+
+j <- runUMAP(
+    j,
+    dim_reduction_to_use = "harmony",
+    dim_reduction_name = "harmony",
+    name = "umap_harmony",
+    dimensions_to_use = seq(ndims)
+)
+
+# Integration QC: dataset-of-origin after correction. Cells should intermingle.
+plotUMAP(
+    j,
+    cell_color = "list_ID",
+    dim_reduction_name = "umap_harmony",
+    cell_color_code = c("red", "blue"),
+    point_size = 0.3,
+    point_border_stroke = 0,
+    save_param = list(
+        save_name = "04-joined-umap-harmony-list-id",
+        base_width = 8,
+        base_height = 6
+    )
+)
+
+# Palette for the celltype overlays — 10 distinct hues.
+cell_colors <- c(
+    "turquoise", "azure4", "pink", "tomato",
+    "chartreuse3", "lightslateblue", "firebrick4",
+    "blue", "magenta", "cornflowerblue"
+)
+
+# Reference view: sc cells coloured by celltype, Xenium cells rendered faint.
+# This is the visual input to the label transfer — shows the density structure
+# the kNN will read from.
+plotUMAP(
+    j,
+    cell_color = "celltype",
+    dim_reduction_name = "umap_harmony",
+    cell_color_code = cell_colors,
+    point_size = 0.5,
+    select_cells = spatIDs(j, subset = list_ID == "sc"),
+    point_border_stroke = 0,
+    other_point_size = 0.3,
+    save_param = list(
+        save_name = "04-joined-umap-harmony-sc-celltype",
+        base_width = 9,
+        base_height = 6
+    )
+)
+
+# Outputs ----------
+saveGiotto(
+    gobject = j,
+    dir = "../checkpoints",
+    foldername = "04-joined-giotto-harmony",
+    method = "saveRDS"
+)
+```
+
+# Label Transfer onto Xenium Cells
+
+- **Algorithm**: `labelTransfer` does a kNN lookup in a chosen reduction; each target cell inherits the majority vote of its `k` nearest labelled neighbours plus a posterior probability
+- **`source_cell_ids = spatIDs(j, subset = list_ID == "sc")`**: only sc cells contribute labels (by construction, only they carry `celltype`); Xenium cells are the targets
+- **`k = 10`**: a conservative neighbourhood — high enough to average over local noise in the kNN, low enough that rare populations (e.g. plasmablasts) don't get smoothed into their more populous neighbours
+- **`reduction_method = "harmony"`**: transfer is done in the *integrated* space, not the raw PCA — this is the whole point of running Harmony first
+- **Two new columns are added**: `trnsfr_celltype` (the label) and `trnsfr_celltype_prob` (posterior probability) — the probability column is what the advanced spatial analyses use to filter confident transfers from imputed ones
+
+```{r}
+#| label: label-transfer
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+j <- labelTransfer(
+    j,
+    source_cell_ids    = spatIDs(j, subset = list_ID == "sc"),
+    k                  = 10,
+    labels             = "celltype",
+    reduction_method   = "harmony",
+    reduction_name     = "harmony",
+    dimensions_to_use  = seq(ndims)
+)
+
+# Visual check — the full joint embedding coloured by the transferred labels.
+plotUMAP(
+    j,
+    cell_color         = "trnsfr_celltype",
+    dim_reduction_name = "umap_harmony",
+    cell_color_code    = cell_colors,
+    point_size         = 0.3,
+    point_border_stroke = 0,
+    save_param = list(
+        save_name = "04-joined-umap-harmony-trnsfr-celltype",
+        base_width = 9,
+        base_height = 6
+    )
+)
+```
+
+| Parameter | Value | Justification |
+|---|---|---|
+| `k` | 10 | Averages local kNN noise without erasing rare populations |
+| `reduction_method` | `"harmony"` | Transfer in the batch-corrected space, not raw PCA |
+| `dimensions_to_use` | `seq(ndims)` (10) | Same subspace used for PCA / UMAP / Harmony |
+
+# Save Final Checkpoint
+
+- **Output**: `../checkpoints/04-joined-giotto-harmony-annotated/` — the downstream input to `05-advanced-spatial.qmd`, which pushes `trnsfr_celltype` back onto the original `xenium_gobj` for spatial-domain analyses
+- **Why keep the intermediate checkpoints**: Harmony and label transfer are both deterministic given the inputs but non-trivial to re-run (Harmony is iterative, label transfer is O(n²) in the kNN build); keeping `joined_giotto_harmony/` around lets us re-run only the label-transfer stage with different `k`
+
+```{r}
+#| label: save-checkpoint
+
+# Libraries ----------
+library(Giotto)
+
+# Outputs ----------
+saveGiotto(
+    gobject = j,
+    dir = "../checkpoints",
+    foldername = "04-joined-giotto-harmony-annotated",
+    method = "saveRDS"
+)
+```

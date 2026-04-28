@@ -1,0 +1,381 @@
+---
+title: "03 — scRNA-Seq Giotto Object + Annotation Transfer"
+author: "Badran Elshenawy"
+date: today
+format:
+  html:
+    theme: darkly
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    self-contained: true
+    title-block-banner: true
+engine: knitr
+execute:
+  eval: false
+  warning: false
+  message: false
+---
+
+# Context
+
+- **Scope**: build a Giotto-native scRNA-Seq object from the same matched h5 used in script `02`, then copy across the cell type labels produced by the Seurat arm
+- **Why this script is needed even though Seurat already holds the labels**: the joint integration in script `04` uses `joinGiottoObjects()`, which requires both datasets to be Giotto objects with compatible slots — there is no direct Seurat→Giotto join path
+- **Division of labour**:
+  - Script `02` (Seurat) — cluster and annotate
+  - Script `03` (this one) — rebuild the sc object in Giotto, attach the Seurat labels, save
+  - Script `04` (integration) — filter to shared features, `joinGiottoObjects`, Harmony, label transfer onto Xenium cells
+- **Upstream**: `../checkpoints/02-sc-seu-annotated.rds` (script 02)
+- **Downstream**: `../checkpoints/03-sc-giotto-annotated/` → consumed by `04-integration.qmd`
+
+## Checkpoint Convention
+
+| Stage | File | Description |
+|---|---|---|
+| Annotated Giotto sc (this script output) | `../checkpoints/03-sc-giotto-annotated/` | Giotto object carrying Seurat-derived `celltype` metadata |
+
+## Dropped approaches (flagged for audit)
+
+- **Giotto-only clustering + annotation** — Leiden partitions did not match published cluster assignments; no clean reference alignment
+- **`GPTCelltype` annotation of Giotto marker tables** — GPT-4 produced unstable / unspecific cell type calls, did not outperform manual marker review
+- **Consequence**: annotation authority lives in the Seurat arm (script 02); the Giotto sc object is a metadata destination, not an independent analytical path
+
+# Setup
+
+- **Python backend and instructions**: mirrors script `01` — plots route to `../write/figures/`, no on-screen rendering during chunk execution
+- **Instructions object is reused**: the same `instrs` configuration is applied to the scRNA-Seq Giotto object for visual consistency with the Xenium arm
+
+```{r}
+#| label: setup-giotto
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+python_path <- ".venv/bin/python"
+set_giotto_python_path(python_path = python_path)
+
+results_folder <- "../write/figures/"
+
+instrs <- createGiottoInstructions(
+    save_dir = results_folder,
+    save_plot = TRUE,
+    show_plot = FALSE,
+    return_plot = FALSE,
+    python_path = python_path
+)
+```
+
+# Load scRNA-Seq Data
+
+- **Input**: `../read/GSM7782696_5p_count_filtered_feature_bc_matrix.h5` — the same 10X filtered matrix consumed by script `02`
+- **`get10Xmatrix_h5(...)$\`Gene Expression\``**: the 10X h5 can contain multiple feature types (Gene Expression, Antibody Capture, HTO, etc.); explicit selection avoids a subtle mismatch when downstream expects only gene-level counts
+- **Minimal construction**: only the expression matrix is loaded — no spatial coordinates, because this is a dissociated scRNA-Seq dataset; Giotto still wraps it as a `giotto` object so the slot structure matches what `joinGiottoObjects()` expects
+
+```{r}
+#| label: load-sc
+
+# Libraries ----------
+library(Giotto)
+
+# Inputs ----------
+expr_data_path <- "../read/GSM7782696_5p_count_filtered_feature_bc_matrix.h5"
+
+# Processing ----------
+sc <- createGiottoObject(
+    expression = get10Xmatrix_h5(expr_data_path)$`Gene Expression`,
+    instructions = instrs
+)
+```
+
+# Quality Control
+
+- **Metric**: mitochondrial transcript fraction per cell, using `addFeatsPerc` over gene IDs matching `^MT-` (human nuclear mito-prefix convention)
+- **Threshold**: `mito < 50%` — deliberately matched to the Seurat arm (script 02) so the two single-cell objects drop the same stressed / dying cells; cross-arm comparability is the priority
+- **Expected effect**: ~5,000 cells removed, ~18,000 retained (figures from the Giotto-only exploration)
+- **Why two violin plots**: a before/after pair is the simplest possible visual audit that the filter did what we expected — the retained distribution should have `mito < 50` everywhere
+
+```{r}
+#| label: qc-mito
+
+# Libraries ----------
+library(Giotto)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+
+# Processing ----------
+# Identify mitochondrial genes by prefix, then compute per-cell % of reads from them.
+fids <- featIDs(sc)
+mt_genes <- fids[grep("^MT-.*", fids)]
+sc <- addFeatsPerc(
+    sc,
+    expression_values = "raw",
+    feats = mt_genes,
+    vector_name = "mito"
+)
+
+# Violin — full distribution before filtration.
+p_mito_pre <- ggplot(
+    spatValues(sc, feats = "mito"),
+    aes(x = "cells", y = mito)
+) +
+    geom_violin() +
+    labs(title = "Mitochondrial % — pre-filter", x = NULL, y = "% mitochondrial UMI")
+
+ggsave(
+    filename = "../write/figures/03-sc-giotto-mito-pre-filter.png",
+    plot = p_mito_pre,
+    width = 5,
+    height = 6,
+    bg = "white"
+)
+
+# Count how many cells fall on each side of the cutoff — printed for a permanent
+# audit trail in the rendered HTML.
+meta <- pDataDT(sc)
+cat("Cells with mito > 50 (to be filtered out):",
+    meta |> filter(mito > 50) |> nrow(), "\n")
+cat("Cells with mito < 50 (to be kept):       ",
+    meta |> filter(mito < 50) |> nrow(), "\n")
+
+sc <- subset(sc, subset = mito < 50)
+
+# Violin — after filter. Should show the same shape truncated at 50%.
+p_mito_post <- ggplot(
+    spatValues(sc, feats = "mito"),
+    aes(x = "cells", y = mito)
+) +
+    geom_violin() +
+    labs(title = "Mitochondrial % — post-filter (< 50%)", x = NULL, y = "% mitochondrial UMI")
+
+ggsave(
+    filename = "../write/figures/03-sc-giotto-mito-post-filter.png",
+    plot = p_mito_post,
+    width = 5,
+    height = 6,
+    bg = "white"
+)
+```
+
+## Scrublet — currently disabled
+
+- **Intended step**: `doScrubletDetect()` to flag / remove predicted doublets before downstream processing
+- **Current status**: crashes R in the uv-managed Python environment — cause traced to an interaction between `scrublet`'s PyTorch dependency chain and reticulate's handling of the Giotto Python backend
+- **Decision**: left commented out until a clean fix is found; downstream clustering appears robust enough without it for this sample
+
+```{r}
+#| label: scrublet-disabled
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+# sc <- doScrubletDetect(sc, return_gobject = TRUE, seed = 0)
+```
+
+# Filter Combinations — Threshold Exploration
+
+- **Purpose**: Giotto's `filterCombinations()` sweeps `(expression_threshold, feat_det_in_min_cells, min_det_feats_per_cell)` tuples and plots how many cells / genes survive each — use it to calibrate the actual filter thresholds below
+- **Swept values here**: `feat_det_in_min_cells = c(20, 100)` — contrasts a lenient (detected in ≥20 cells) vs. stricter (≥100) gene filter; the lenient setting is chosen for the processing pass since it preserves rare lineage markers
+
+```{r}
+#| label: filter-combinations
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+filterCombinations(
+    sc,
+    expression_thresholds = 1,
+    feat_det_in_min_cells = c(20, 100),
+    save_param = list(
+        save_name = "03-sc-giotto-filter-combinations",
+        base_width = 7,
+        base_height = 5
+    )
+)
+```
+
+# Processing Pipeline
+
+- **Filter thresholds**:
+  - `expression_threshold = 1` — a gene is "detected" in a cell if it has ≥1 UMI
+  - `feat_det_in_min_cells = 20` — drop genes not seen in ≥20 cells (removes dropout noise while keeping rare lineage markers)
+  - `min_det_feats_per_cell = 200` — drop cells expressing <200 genes (stricter than the Xenium panel because scRNA-Seq is transcriptome-wide)
+- **`calculateHVF`**: HVF selection is used here (unlike the Xenium arm) because the transcriptome-wide space (~30k genes) is large enough that noise-dominated features will otherwise drown the signal in PCA
+- **`runPCA`**: uses the HVF-selected features by default
+- **`screePlot(ncp = 50)`**: look further out than the Xenium arm because scRNA-Seq PCs decay more slowly
+
+```{r}
+#| label: filter-normalise-pca
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+sc <- sc |>
+    filterGiotto(
+        expression_threshold = 1,
+        feat_det_in_min_cells = 20,
+        min_det_feats_per_cell = 200
+    ) |>
+    normalizeGiotto() |>
+    calculateHVF() |>
+    runPCA()
+
+screePlot(
+    sc,
+    ncp = 50,
+    save_param = list(
+        save_name = "03-sc-giotto-scree-plot",
+        base_width = 7,
+        base_height = 5
+    )
+)
+```
+
+| Parameter | Value | Justification |
+|---|---|---|
+| `expression_threshold` | 1 | Single-UMI detection standard |
+| `feat_det_in_min_cells` | 20 | Lenient; preserves rare markers |
+| `min_det_feats_per_cell` | 200 | Standard scRNA-Seq cutoff |
+| `ncp` (scree) | 50 | scRNA-Seq PCs decay slowly |
+
+## Dimensional Reduction
+
+- **`dimensions_to_use = seq(30)`**: 30 PCs is the standard scRNA-Seq default — more than the Xenium arm (10) because the transcriptome-wide feature space holds more dimensions of real biology
+- **`runUMAP` only (no tSNE)**: UMAP preserves the global structure relevant to the later Harmony integration; tSNE would be purely decorative
+
+```{r}
+#| label: umap
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+sc <- runUMAP(sc, dimensions_to_use = seq(30))
+
+dimPlot2D(
+    sc,
+    save_param = list(
+        save_name = "03-sc-giotto-umap",
+        base_width = 7,
+        base_height = 6
+    )
+)
+```
+
+# Clustering
+
+- **`res = 0.5`**: mid-range Leiden resolution; the Giotto clusters are not the annotation source (Seurat is), so the exact partitioning here is less consequential than in script `01` — the goal is just to have a coherent embedding structure to inspect
+- **Cluster plot retained** as a diagnostic for the annotation-transfer step: if Giotto clusters and Seurat-derived celltypes disagree sharply, it flags an issue in the transfer join
+
+```{r}
+#| label: clustering
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+sc <- sc |>
+    createNearestNetwork(dimensions_to_use = seq(30)) |>
+    doLeidenCluster(res = 0.5)
+
+dimPlot2D(
+    sc,
+    cell_color = "leiden_clus",
+    point_size = 0.6,
+    point_border_stroke = 0,
+    save_param = list(
+        save_name = "03-sc-giotto-umap-leiden-clusters",
+        base_width = 8,
+        base_height = 6
+    )
+)
+```
+
+# Transferring Seurat Annotations onto the Giotto sc Object
+
+- **Strategy**: cell-ID join — both the Giotto and Seurat objects were built from the same 10X h5, so their cell barcodes are the same strings and can be intersected directly
+- **Why `intersect` is still needed**: the two arms apply different filters (`min_det_feats_per_cell = 200` in Giotto; `percent.mt < 50` only in Seurat) — the common cell set is ≤ either individual arm
+- **Column-order invariant (`colnames == colnames |> all()`)**: `intersect(giotto_cells, seurat_cells)` preserves the left-hand ordering, so subsetting the Seurat object by that vector yields matching column order — the assertion confirms it
+- **`addCellMetadata(by_column = TRUE, column_cell_ID = "cell_ID")`**: joins the annotation table onto Giotto's cell metadata keyed on `cell_ID`; Giotto fills `NA` for any Giotto cell missing from `celltype_df`
+
+```{r}
+#| label: annotation-transfer
+
+# Libraries ----------
+library(Giotto)
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+sc_seu_annotated <- read_rds("../checkpoints/02-sc-seu-annotated.rds")
+
+# Processing ----------
+# Shared cell barcodes between the two arms.
+giotto_cells <- sc |> colnames()
+seurat_cells <- sc_seu_annotated |> colnames()
+common_cells <- intersect(giotto_cells, seurat_cells)
+
+# Base-R subsetting by cell ID (not a tidyverse filter): preserves the exact
+# column order from `common_cells`, which is what lets the downstream assertion
+# hold. tidyseurat::filter(.cell %in% common_cells) would lose that ordering.
+seurat_cells_subset <- sc_seu_annotated[, common_cells]
+
+# Invariant check — fail loudly here rather than silently in the metadata join.
+stopifnot(all(colnames(sc) == colnames(seurat_cells_subset)))
+
+# Build the transfer frame. celltype is coerced to character so downstream
+# factor ordering does not carry over.
+celltype_df <- data.frame(
+    cell_ID  = colnames(seurat_cells_subset),
+    celltype = as.character(seurat_cells_subset$celltype)
+)
+
+sc <- addCellMetadata(
+    sc,
+    new_metadata   = celltype_df,
+    by_column      = TRUE,
+    column_cell_ID = "cell_ID"
+)
+
+# UMAP coloured by the transferred labels — final visual audit of the join.
+dimPlot2D(
+    sc,
+    cell_color = "celltype",
+    point_size = 0.6,
+    save_param = list(
+        save_name = "03-sc-giotto-umap-celltype",
+        base_width = 8,
+        base_height = 6
+    )
+)
+
+# Print metadata to confirm the celltype column landed alongside the existing slots.
+print(pDataDT(sc))
+```
+
+# Save Checkpoint
+
+- **`saveGiotto`, not `write_rds`**: scRNA-Seq Giotto objects do not carry raster images, but they still carry arrow-backed expression slots; `saveGiotto` is the safe default across all Giotto objects
+- **Output path**: `../checkpoints/03-sc-giotto-annotated/` — consumed by `04-integration.qmd`
+
+```{r}
+#| label: save-checkpoint
+
+# Libraries ----------
+library(Giotto)
+
+# Outputs ----------
+saveGiotto(
+    gobject = sc,
+    dir = "../checkpoints",
+    foldername = "03-sc-giotto-annotated",
+    method = "saveRDS"
+)
+```

@@ -1,0 +1,892 @@
+---
+title: "05 — Advanced Spatial Analysis"
+author: "Badran Elshenawy"
+date: 2026-04-21T09:00:00Z
+format: html
+---
+
+# Advanced Spatial Analysis
+
+-   The sections that follow lean into the analyses that Giotto does uniquely well
+-   Everything below assumes cell types live on `xenium_gobj` in a column called `trnsfr_celltype`, with the full polygon/transcript/image information available
+-   Each section saves its own checkpoint so any analysis can be rebuilt independently without rerunning the full pipeline
+
+## Transfer Cell Types Back to Xenium Object
+
+-   Right now the transferred labels live on `j` (the joined object). For spatial analyses we need them on the original `xenium_gobj` so we can use the H&E/IF images, the full polygon information, and the raw transcript point cloud
+-   Pull the labelled metadata from `j`, strip the `xen-` prefix that `joinGiottoObjects()` added, and merge back in via `addCellMetadata()`
+
+```{r}
+#| label: push-labels-back-to-xenium
+
+# libraries ----------
+library(Giotto)
+library(tidyverse)
+
+# setup ----------
+python_path <- ".venv/bin/python"
+set_giotto_python_path(python_path = python_path)
+
+results_folder <- "../write/figures/"
+tables_folder <- "../write/tables/"
+
+load_giotto_checkpoint <- function(folder_path, rds_path, reconnect_giottoImage) {
+    if (dir.exists(folder_path) && file.exists(file.path(folder_path, "gobject.RDS"))) {
+        return(loadGiotto(
+            path_to_folder = folder_path,
+            reconnect_giottoImage = reconnect_giottoImage,
+            python_path = python_path
+        ))
+    }
+
+    readRDS(rds_path)
+}
+
+# data import ----------
+j <- load_giotto_checkpoint(
+    folder_path = "../checkpoints/04-joined-giotto-harmony-annotated",
+    rds_path = "../checkpoints/04-joined-giotto-harmony-annotated.rds",
+    reconnect_giottoImage = FALSE
+)
+xenium_gobj <- load_giotto_checkpoint(
+    folder_path = "../checkpoints/01-xenium-gobj",
+    rds_path = "../checkpoints/01-xenium-gobj.rds",
+    reconnect_giottoImage = TRUE
+)
+
+
+# extract labelled xenium cells from the joined object ----------
+ann_meta <- pDataDT(j) |>
+    as_tibble() |>
+    filter(list_ID == "xen") |>
+    mutate(cell_identifier = str_remove(cell_ID, "^xen-")) |>
+    select(cell_identifier, trnsfr_celltype, trnsfr_celltype_prob)
+
+# merge onto the Xenium object ----------
+xenium_gobj <- addCellMetadata(
+    xenium_gobj,
+    new_metadata = ann_meta,
+    by_column = T,
+    column_cell_ID = "cell_identifier"
+)
+
+# Fixing NAs ------
+ann_meta <- pDataDT(xenium_gobj) |>
+    as_tibble() |>
+    mutate(
+        label_source = if_else(is.na(trnsfr_celltype), "imputed", "transferred"),
+        trnsfr_celltype = replace_na(trnsfr_celltype, "cancer_epithelial")
+    )
+
+xenium_gobj <- addCellMetadata(
+    xenium_gobj,
+    new_metadata = ann_meta,
+    by_column = T,
+    column_cell_ID = "cell_ID"
+)
+
+# subset giotto object to keep non-NA values ------
+Giotto::dimPlot2D(
+  gobject = xenium_gobj,
+  cell_color = "trnsfr_celltype",
+  show_plot = T
+)
+
+
+# sanity check
+pDataDT(xenium_gobj) |>
+    as_tibble() |>
+    count(trnsfr_celltype, sort = TRUE)
+
+# cell type colour code used throughout advanced analyses ----------
+cell_colors <- c(
+    "cancer_epithelial" = "firebrick3",
+    "CD4T"              = "chartreuse3",
+    "myeloid"           = "lightslateblue",
+    "endothelial"       = "tomato",
+    "mesenchymal"       = "azure4",
+    "B"                 = "magenta",
+    "plasmablast"       = "cornflowerblue"
+)
+
+# saving ----------
+saveGiotto(
+    gobject = xenium_gobj,
+    dir = "../checkpoints",
+    foldername = "05-xenium-gobj-celltyped",
+    method = "RDS",
+    overwrite = TRUE
+)
+```
+
+## Spatial Network Construction
+
+-   Every analysis below depends on a spatial graph of the cells. Cells are nodes; edges connect spatial neighbours
+-   Two standard choices, and I build both because different analyses benefit from different graph structures:
+    -   **Delaunay triangulation** — geometrically principled, connects every cell to its natural geometric neighbours. Best for "who actually touches whom" questions (cell proximity enrichment, interaction-changed genes, niche analysis)
+    -   **kNN** — fixed number of neighbours per cell. Better for methods that assume constant connectivity across the graph (HMRF, spatial co-expression modules)
+-   The `maximum_distance_knn` cap is important: without it, isolated cells near tissue edges get connected to cells on the opposite side of gaps, producing spurious interactions downstream
+    -   50 μm is a reasonable default for Xenium — roughly 2-3 cell diameters
+
+```{r}
+#| label: build-spatial-networks
+
+# libraries ----------
+library(Giotto)
+
+# data import ----------
+xenium_gobj <- load_giotto_checkpoint(
+    folder_path = "../checkpoints/05-xenium-gobj-celltyped",
+    rds_path = "../checkpoints/05-xenium-gobj-celltyped.rds",
+    reconnect_giottoImage = TRUE
+)
+
+# Delaunay network for proximity/interaction analyses ----------
+xenium_gobj <- createSpatialNetwork(
+    xenium_gobj,
+    method = "Delaunay",
+    name   = "Delaunay_network"
+)
+
+# kNN network for HMRF and spatial co-expression ----------
+xenium_gobj <- createSpatialNetwork(
+    xenium_gobj,
+    method = "kNN",
+    k = 6,
+    maximum_distance_knn = 50,   # microns — cap on edge length
+    name = "knn_k6"
+)
+
+# visualise the Delaunay graph over the tissue ----------
+spatPlot2D(xenium_gobj,  
+    show_network = TRUE,
+    network_color = "blue", 
+    spatial_network_name = "knn_k6",
+    show_plot = T
+)
+
+spatPlot2D(xenium_gobj,  
+    show_network = TRUE,
+    network_color = "blue", 
+    spatial_network_name = "Delaunay_network",
+    show_plot = T,
+    cell_color = "trnsfr_celltype",
+    save_param = list(
+        save_name   = "05-xenium-spatial-network-delaunay",
+        base_width  = 12,
+        base_height = 10
+    )
+)
+
+spatPlot2D(xenium_gobj,  
+    show_network = TRUE,
+    network_color = "blue", 
+    spatial_network_name = "knn_k6",
+    show_plot = T,
+    cell_color = "trnsfr_celltype",
+    save_param = list(
+        save_name   = "05-xenium-spatial-network-knn",
+        base_width  = 12,
+        base_height = 10
+    )
+)
+
+spatPlot2D(
+    xenium_gobj,
+    show_network = TRUE,
+    network_color = "grey60",
+    network_alpha = 0.2,
+    spatial_network_name = "Delaunay_network",
+    cell_color = "trnsfr_celltype",
+    cell_color_code = cell_colors,
+    point_size = 0.3,
+    point_shape = "no_border",
+    save_param = list(
+        save_name   = "05-xenium-spatial-network-delaunay",
+        base_width  = 12,
+        base_height = 10
+    )
+)
+
+
+# saving ----------
+saveGiotto(
+    gobject = xenium_gobj,
+    dir = "../checkpoints",
+    foldername = "05-xenium-gobj-with-networks",
+    method = "RDS",
+    overwrite = TRUE
+)
+```
+
+## Cell Proximity Enrichment
+
+-   For every pair of cell types, this tests whether they are spatial neighbours more or less often than expected under random cell-type shuffling
+-   Output is a symmetric heatmap of enrichment scores — which cell types cluster together beyond chance
+-   Biological questions this answers for breast cancer:
+    -   Are CD4T and B cells co-enriched? → tertiary lymphoid structures
+    -   Is cancer_epithelial adjacent to myeloid, or segregated? → infiltrated vs immune-excluded tumor phenotype
+    -   Are mesenchymal cells clustered near endothelial? → vasculogenic niches / CAF-vasculature coupling
+-   What to look for: the diagonal is always positive (cells of the same type cluster with themselves) and uninformative. The off-diagonal signals are the story
+
+```{r}
+#| label: cell-proximity-enrichment
+
+# libraries ----------
+library(Giotto)
+
+# data import ----------
+xenium_gobj <- load_giotto_checkpoint(
+    folder_path = "../checkpoints/05-xenium-gobj-with-networks",
+    rds_path = "../checkpoints/05-xenium-gobj-with-networks.rds",
+    reconnect_giottoImage = TRUE
+)
+
+# run enrichment test ----------
+cpe <- cellProximityEnrichment(
+    xenium_gobj,
+    cluster_column        = "trnsfr_celltype",
+    spatial_network_name  = "Delaunay_network",
+    number_of_simulations = 1000
+)
+
+# heatmap of enrichment scores ----------
+cellProximityHeatmap(
+    xenium_gobj,
+    CPscore          = cpe,
+    order_cell_types = TRUE,
+    color_breaks     = c(-1.5, 0, 1.5),
+    color_names      = c("steelblue", "white", "firebrick"),
+    save_param = list(
+        save_name   = "05-cell-proximity-heatmap",
+        base_width  = 9,
+        base_height = 8
+    )
+)
+
+# network-style visualisation ----------
+cellProximityNetwork(
+    xenium_gobj,
+    CPscore                    = cpe,
+    remove_self_edges          = TRUE,
+    only_show_enrichment_edges = TRUE,
+    save_param = list(
+        save_name   = "05-cell-proximity-network",
+        base_width  = 10,
+        base_height = 8
+    )
+)
+
+# barplot of all significant interactions ----------
+cellProximityBarplot(
+    xenium_gobj,
+    CPscore       = cpe,
+    min_orig_ints = 5,
+    min_sim_ints  = 5,
+    save_param = list(
+        save_name   = "05-cell-proximity-barplot",
+        base_width  = 10,
+        base_height = 8
+    )
+)
+
+# saving the CPE result for downstream sections ----------
+write_rds(cpe, "../checkpoints/05-cpe-result.rds", compress = "gz")
+```
+
+## Interaction-Changed Genes (ICG)
+
+-   This is the analysis that distinguishes Giotto from Seurat and Squidpy. Cell proximity tells you *who* touches whom; ICG tells you *what changes* in gene expression when they do
+-   For each cell type pair, ICG asks: are there genes that are differentially expressed in cells of type A *specifically when spatially adjacent to* cells of type B?
+-   Biologically central for breast cancer TME because local signalling is the whole point of the microenvironment — cancer cells adjacent to CD8T cells may behave very differently from cancer cells deep in the tumor core, and that difference is what ICG measures
+-   Every significant hit is a testable hypothesis about local signalling
+
+```{r}
+#| label: interaction-changed-genes
+
+# libraries ----------
+library(Giotto)
+library(tidyverse)
+
+# data import ----------
+xenium_gobj <- load_giotto_checkpoint(
+    folder_path = "../checkpoints/05-xenium-gobj-with-networks",
+    rds_path = "../checkpoints/05-xenium-gobj-with-networks.rds",
+    reconnect_giottoImage = TRUE
+)
+
+# find interaction-changed features across all cell-type pairs ----------
+icg <- findInteractionChangedFeats(
+    xenium_gobj,
+    cluster_column       = "trnsfr_celltype",
+    spatial_network_name = "Delaunay_network",
+    selected_feats       = NULL,      # test all genes
+    nr_permutations      = 500,
+    adjust_method        = "fdr"
+)
+
+# tidy and filter the result ----------
+icg_df <- icg$ICFscores |>
+    as_tibble() |>
+    filter(p.adj < 0.05) |>
+    arrange(desc(abs(log2fc)))
+
+# top hits for cancer_epithelial — the main cell type of interest ----------
+icg_df |>
+    filter(cell_type == "cancer_epithelial") |>
+    filter(int_cell_type %in% c("CD4T", "myeloid", "mesenchymal", "B")) |>
+    group_by(int_cell_type) |>
+    slice_head(n = 10) |>
+    ungroup() |>
+    print(n = 40)
+
+# pull top ICG genes per interaction partner to pass to the plot ----------
+# ICF_feats is a named list: name = interacting cell type,
+# value = character vector of genes to plot
+top_icf_feats <- icg_df |>
+    filter(cell_type == "cancer_epithelial") |>
+    filter(int_cell_type %in% c("CD4T", "myeloid", "mesenchymal")) |>
+    group_by(int_cell_type) |>
+    slice_head(n = 4) |>
+    ungroup() |>
+    split(~ int_cell_type) |>
+    map(~ pull(.x, feats))
+
+top_icf_feats
+
+# canonical cancer_epithelial markers for context ----------
+# source_markers appear on the plot as a reference for the focal cell type
+cancer_markers <- c("KRT8", "EPCAM", "MLPH", "FOXA1")
+
+# visualise interaction-changed genes with cancer_epithelial as source ----------
+plotInteractionChangedFeats(
+    gobject           = xenium_gobj,
+    icfObject         = icg,
+    source_type       = "cancer_epithelial",
+    source_markers    = cancer_markers,
+    ICF_feats         = top_icf_feats$CD4T,
+    cell_color_code   = cell_colors,
+    save_param = list(
+        save_name   = "05-icg-cancer-vs-immune-stroma",
+        base_width  = 14,
+        base_height = 8
+    )
+)
+
+# also run with myeloid as the source to flip the perspective ----------
+# what changes in myeloid cells when adjacent to cancer, T cells, or B cells?
+top_icf_feats_myeloid <- icg_df |>
+    filter(cell_type == "myeloid") |>
+    filter(int_cell_type %in% c("cancer_epithelial", "CD4T", "B")) |>
+    group_by(int_cell_type) |>
+    slice_head(n = 4) |>
+    ungroup() |>
+    split(~ int_cell_type) |>
+    map(~ pull(.x, feats))
+
+myeloid_markers <- c("CD68", "LYZ", "TYROBP", "AIF1")
+
+plotInteractionChangedFeats(
+    gobject         = xenium_gobj,
+    icfObject       = icg,
+    source_type     = "myeloid",
+    source_markers  = myeloid_markers,
+    ICF_feats       = top_icf_feats_myeloid$CD4T,
+    cell_color_code = cell_colors,
+    save_param = list(
+        save_name   = "05-icg-myeloid-vs-cancer-t-b",
+        base_width  = 14,
+        base_height = 8
+    )
+)
+
+# saving ----------
+write_rds(icg, "../checkpoints/05-icg-result.rds", compress = "gz")
+write_csv(icg_df, file.path(tables_folder, "05-icg-significant-interactions.csv"))
+```
+
+-   What to expect in the output:
+    -   cancer_epithelial × CD4T → MHC II machinery (HLA-DRA, HLA-DPA1), interferon-response genes if adaptive immunity is active
+    -   cancer_epithelial × myeloid → CD274 (PD-L1), chemokines, EMT-linked genes — TAM-driven state change
+    -   cancer_epithelial × mesenchymal → ECM remodelling genes, SNAI1/ZEB1/ZEB2 if EMT is activated at the stromal interface
+-   None of these interpretations are guaranteed — they depend on what this specific tumor is doing. That's the point: ICG generates hypotheses rather than assuming them
+
+## Niche Analysis — Multicellular Neighbourhoods
+
+-   Cell types describe what individual cells are; niches describe what multicellular *neighbourhoods* look like
+-   Compute each cell's local neighbourhood composition (fraction of each cell type among its neighbours), then cluster cells by those composition vectors
+-   Expected in breast cancer: tumor core, tumor-immune interface, CAF-rich stroma, immune aggregate, vascular niche, mixed/transitional
+-   Different from HMRF in a meaningful way: niches cluster *composition*, HMRF clusters *expression*. Complementary views
+
+```{r}
+# libraries ----------
+library(Giotto)
+library(tidyverse)
+
+# paths — same variables you used in the initial data load ----------
+data_path <- "../read/"
+path_he   <- "../read/Xenium_FFPE_Human_Breast_Cancer_Rep1_he_image.ome.tif"
+path_if   <- "../read/Xenium_FFPE_Human_Breast_Cancer_Rep1_if_image.ome.tif"
+
+# recreate the IF .tif conversions (or reuse the existing tif_exports) ----------
+conv_path_he <- GiottoClass::ometif_to_tif(path_he,overwrite = T)
+conv_path_if <- map(1:3, function(p) {
+    GiottoClass::ometif_to_tif(path_if, page = p, overwrite = T)
+})
+if_channels <- GiottoClass::ometif_metadata(path_if, node = "Channel")$Name
+# [1] "CD20" "HER2" "DAPI"
+
+# strip the dead images off the object ----------
+xenium_gobj@images <- list()
+
+# rebuild images from disk ----------
+x <- importXenium(file.path(data_path, "outs"))
+
+# post-Xenium H&E
+img_he <- x$load_aligned_image(
+        name                = "post_he",
+        path                = conv_path_he,
+        imagealignment_path = "../read/Xenium_FFPE_Human_Breast_Cancer_Rep1_he_imagealignment.csv"
+)
+
+# post-Xenium IF (CD20, HER2, DAPI)
+img_if <- lapply(1:3, function(if_i) {
+    x$load_aligned_image(
+        name                = if_channels[[if_i]],
+        path                = conv_path_if[[if_i]],
+        imagealignment_path = "../read/Xenium_FFPE_Human_Breast_Cancer_Rep1_if_imagealignment.csv"
+    )
+})
+
+# reattach ----------
+xenium_gobj <- setGiotto(xenium_gobj, c(list(img_he), img_if))
+
+# verify ----------
+showGiottoImageNames(xenium_gobj)   # should list post_he, CD20, HER2, DAPI
+plot(xenium_gobj@images$post_he)        # should now render
+```
+
+```{r}
+#| label: niche-analysis
+
+# libraries ----------
+library(Giotto)
+library(tidyverse)
+
+# data import ----------
+xenium_gobj <- load_giotto_checkpoint(
+    folder_path = "../checkpoints/05-xenium-gobj-with-networks",
+    rds_path = "../checkpoints/05-xenium-gobj-with-networks.rds",
+    reconnect_giottoImage = TRUE
+)
+
+# compute per-cell neighbourhood composition ----------
+xenium_gobj <- calculateSpatCellMetadataProportions(
+    xenium_gobj,
+    spat_network    = "Delaunay_network",
+    metadata_column = "trnsfr_celltype",
+    name            = "niche_composition"
+)
+
+# extract composition matrix ----------
+comp_mat <- getSpatialEnrichment(
+    xenium_gobj,
+    name   = "niche_composition",
+    output = "data.table"
+)
+comp_matrix <- as.matrix(comp_mat[, -"cell_ID"])
+rownames(comp_matrix) <- comp_mat$cell_ID
+
+# k-means cluster on composition space ----------
+set.seed(1)
+niche_km <- kmeans(
+    comp_matrix,
+    centers  = 6,
+    iter.max = 50,
+    nstart   = 10
+)
+
+# attach niche labels back to the object ----------
+xenium_gobj <- addCellMetadata(
+    xenium_gobj,
+    new_metadata = data.frame(
+        cell_ID = names(niche_km$cluster),
+        niche   = paste0("niche_", niche_km$cluster)
+    ),
+    by_column      = TRUE,
+    column_cell_ID = "cell_ID"
+)
+
+# spatial visualisation ----------
+niche_colors <- c(
+  "niche_1" = "#E41A1C",
+  "niche_2" = "#377EB8",
+  "niche_3" = "#4DAF4A",
+  "niche_4" = "#984EA3",
+  "niche_5" = "#FF7F00",
+  "niche_6" = "#FFFF33"
+)
+
+spatInSituPlotPoints(
+    xenium_gobj,
+    polygon_fill            = "niche",
+    polygon_fill_as_factor  = TRUE,
+    polygon_fill_code       = niche_colors,
+    polygon_line_size       = 0,
+    show_image              = TRUE,
+    image_name              = "HER2",
+    save_param = list(
+        save_name   = "05-niches-on-he",
+        base_width  = 14,
+        base_height = 10
+    )
+)
+
+
+# interpret each niche by its dominant cell types ----------
+niche_summary <- tibble(
+    cell_ID = names(niche_km$cluster),
+    niche   = paste0("niche_", niche_km$cluster)
+) |>
+    left_join(
+        pDataDT(xenium_gobj) |>
+            as_tibble() |>
+            select(cell_ID, trnsfr_celltype),
+        by = "cell_ID"
+    ) |>
+    count(niche, trnsfr_celltype) |>
+    group_by(niche) |>
+    mutate(frac = n / sum(n)) |>
+    ungroup()
+
+# composition heatmap ----------
+p_niche <- niche_summary |>
+    ggplot(aes(x = niche, y = trnsfr_celltype, fill = frac)) +
+    geom_tile() +
+    scale_fill_viridis_c() +
+    labs(
+        title = "Cell-type composition by niche",
+        x     = NULL, y = NULL, fill = "Fraction"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+    filename = file.path(results_folder, "05-niche-composition-heatmap.png"),
+    plot     = p_niche,
+    width    = 8,
+    height   = 6,
+    dpi      = 300
+)
+
+# saving ----------
+saveGiotto(
+    gobject = xenium_gobj,
+    dir = "../checkpoints",
+    foldername = "05-xenium-gobj-with-niches",
+    method = "RDS",
+    overwrite = TRUE
+)
+```
+
+-   The spatial plot plus the composition heatmap gives a dual view — *where* each niche sits on the tissue and *what* defines it biologically
+-   Pairs naturally with ICG: once you know a cell's niche, you can ask whether expression changes between, say, cancer cells in the "tumor core" niche vs cancer cells in the "tumor-immune interface" niche. That's invasion-front biology
+
+## HMRF Spatial Domain Detection
+
+-   HMRF (Hidden Markov Random Field) was introduced in the original Giotto paper and remains one of its signature methods. It jointly infers a domain assignment for each cell using both the cell's own expression profile and the expression states of its neighbours
+-   Critically different from niche analysis: niches cluster *composition*, HMRF clusters *expression with spatial smoothing*
+-   For breast cancer HMRF typically recovers DCIS duct structures, invasive tumor zones, stromal bands, and immune regions as distinct transcriptional domains — often aligning with what a pathologist would annotate on H&E
+-   The beta parameter controls spatial smoothing: low beta → fragmented domains driven by expression alone, high beta → large coherent regions that may miss fine structure. Mid-range (6–14) is usually the sweet spot for Xenium breast cancer
+
+```{r}
+#| label: hmrf-domains
+
+# libraries ----------
+library(Giotto)
+library(tidyverse)
+
+# data import ----------
+xenium_gobj <- load_giotto_checkpoint(
+    folder_path = "../checkpoints/05-xenium-gobj-with-niches",
+    rds_path = "../checkpoints/05-xenium-gobj-with-niches.rds",
+    reconnect_giottoImage = TRUE
+)
+
+# spatial variable genes via BinSpect ----------
+# these are the features that vary more spatially than random expectation
+ranktest <- binSpect(
+    xenium_gobj,
+    bin_method           = "rank",
+    calc_hub             = TRUE,
+    hub_min_int          = 5,
+    spatial_network_name = "knn_k6"
+)
+
+svgs <- ranktest[adj.p.value < 0.01, feats][1:100]
+
+# run HMRF ----------
+hmrf_folder <- file.path(results_folder, "hmrf_output")
+dir.create(hmrf_folder, showWarnings = FALSE, recursive = TRUE)
+
+HMRF_out <- doHMRF(
+    xenium_gobj,
+    expression_values    = "scaled",
+    spatial_network_name = "knn_k6",
+    spatial_genes        = svgs,
+    k                    = 8,
+    betas                = c(0, 2, 10),   # tests beta = 0, 2, 4, ..., 20
+    output_folder        = hmrf_folder
+)
+
+# add selected HMRF results to the Giotto object ----------
+xenium_gobj <- addHMRF(
+    xenium_gobj,
+    HMRFoutput   = HMRF_out,
+    k            = 8,
+    betas_to_add = c(6, 10, 14),
+    hmrf_name    = "HMRF"
+)
+
+# visualise each beta solution on H&E ----------
+for (b in c(6, 10, 14)) {
+    spatInSituPlotPoints(
+        xenium_gobj,
+        polygon_fill            = paste0("HMRF_k8_b.", b),
+        polygon_fill_as_factor  = TRUE,
+        polygon_line_size       = 0,
+        show_image              = TRUE,
+        image_name              = "post_he",
+        save_param = list(
+            save_name   = paste0("05-hmrf-domains-k8-beta", b),
+            base_width  = 14,
+            base_height = 10
+        )
+    )
+}
+spatInSituPlotPoints(
+    xenium_gobj,
+    polygon_fill           = "trnsfr_celltype",
+    polygon_fill_as_factor = TRUE,
+    polygon_fill_code      = cell_colors,
+    polygon_line_size      = 0,
+    show_image             = FALSE,
+    background_color       = "black"
+    )
+
+# cross-tabulate HMRF domains against cell types ----------
+# tells you which cell types populate each domain — domain interpretation handle
+domain_celltype <- pDataDT(xenium_gobj) |>
+    as_tibble() |>
+    count(HMRF_k8_b.10, trnsfr_celltype) |>
+    group_by(HMRF_k8_b.10) |>
+    mutate(frac = n / sum(n)) |>
+    ungroup()
+
+p_domain <- domain_celltype |>
+    ggplot(aes(x = factor(HMRF_k8_b.10), y = trnsfr_celltype, fill = frac)) +
+    geom_tile() +
+    scale_fill_viridis_c() +
+    labs(
+        title = "Cell-type composition per HMRF domain",
+        x     = "HMRF domain (k=8, beta=10)",
+        y     = NULL,
+        fill  = "Fraction"
+    ) +
+    theme_minimal()
+
+ggsave(
+    filename = file.path(results_folder, "05-hmrf-domain-composition.png"),
+    plot     = p_domain,
+    width    = 8,
+    height   = 6,
+    dpi      = 300
+)
+
+# saving ----------
+saveGiotto(
+    gobject = xenium_gobj,
+    dir = "../checkpoints",
+    foldername = "05-xenium-gobj-with-hmrf",
+    method = "RDS",
+    overwrite = TRUE
+)
+```
+
+-   What to look for:
+    -   Domains that map onto recognisable H&E structures (ducts, stromal bands, tumor nests) → HMRF is capturing real anatomy
+    -   A domain dominated by a single cell type → essentially a cell-type map, less novel information
+    -   A domain mixing cancer_epithelial with specific stromal/immune cells → a true microenvironmental region, biologically interesting
+    -   Domains that split across replicates or beta values → unstable, consider collapsing
+
+## HER2 Protein ↔ ERBB2 RNA Bivariate Spatial Analysis
+
+-   Multimodal integration that the Python spatial ecosystem cannot do cleanly in a single object. The HER2 IF image and the ERBB2 transcripts already live in `xenium_gobj`; we just need to aggregate both into the same spatial tiles and compare
+-   Core question: does HER2 protein intensity spatially correlate with ERBB2 mRNA counts, and at what spatial resolution does that correlation peak?
+-   Directly mirrors Figure 3 of the Giotto Suite Nature Methods paper
+-   Biologically meaningful: HER2 protein expression is a decisive clinical marker for breast cancer (targeted therapy with trastuzumab). Showing that the Xenium ERBB2 transcript signal tracks the HER2 IF signal validates both modalities and gives a quantitative handle on the spatial scale at which they agree
+
+```{r}
+#| label: her2-if-vs-erbb2-rna
+
+# libraries ----------
+library(Giotto)
+library(tidyverse)
+
+# data import ----------
+xenium_gobj <- load_giotto_checkpoint(
+    folder_path = "../checkpoints/05-xenium-gobj-with-hmrf",
+    rds_path = "../checkpoints/05-xenium-gobj-with-hmrf.rds",
+    reconnect_giottoImage = TRUE
+)
+
+# hexagonal tessellation at multiple resolutions ----------
+bin_sizes <- c(20, 40, 80, 160)   # microns side length
+
+bivariate_results <- map_dfr(bin_sizes, function(bsize) {
+    # create hex tessellation at this bin size
+    hex_name <- paste0("hex_", bsize)
+    xenium_hex <- tessellate(
+        extent     = ext(xenium_gobj),
+        shape      = "hexagon",
+        shape_size = bsize,
+        name       = hex_name
+    )
+
+    # aggregate ERBB2 transcripts and HER2 intensity into the hex bins
+    xenium_gobj_h <- addSpatialCentroidLocations(
+        xenium_gobj, poly_info = hex_name
+    )
+    xenium_gobj_h <- calculateOverlapPolygonImages(
+        xenium_gobj_h,
+        image_names = "HER2",
+        poly_info   = hex_name
+    )
+    xenium_gobj_h <- overlapImagesToMatrix(
+        xenium_gobj_h,
+        poly_info = hex_name,
+        name      = "HER2_intensity"
+    )
+
+    xenium_gobj_h <- calculateOverlapRaster(
+        xenium_gobj_h,
+        spatial_info = hex_name,
+        feat_info    = "rna"
+    )
+    xenium_gobj_h <- overlapToMatrix(
+        xenium_gobj_h,
+        poly_info = hex_name,
+        feat_info = "rna",
+        name      = "raw"
+    )
+
+    # extract aligned vectors
+    erbb2_per_bin <- getExpression(
+        xenium_gobj_h,
+        spat_unit = hex_name,
+        feat_type = "rna",
+        values    = "raw",
+        output    = "matrix"
+    )["ERBB2", ]
+
+    her2_per_bin <- getExpression(
+        xenium_gobj_h,
+        spat_unit = hex_name,
+        feat_type = "HER2_intensity",
+        values    = "raw",
+        output    = "matrix"
+    )[1, ]
+
+    # align bins and compute correlations
+    common_bins <- intersect(names(erbb2_per_bin), names(her2_per_bin))
+    tibble(
+        bin_size_um = bsize,
+        pearson     = cor(erbb2_per_bin[common_bins], her2_per_bin[common_bins]),
+        spearman    = cor(erbb2_per_bin[common_bins], her2_per_bin[common_bins],
+                          method = "spearman"),
+        n_bins      = length(common_bins)
+    )
+})
+
+print(bivariate_results)
+
+# correlation vs bin size ----------
+p_corr <- bivariate_results |>
+    pivot_longer(c(pearson, spearman), names_to = "metric", values_to = "r") |>
+    ggplot(aes(x = bin_size_um, y = r, colour = metric)) +
+    geom_line(size = 1) +
+    geom_point(size = 3) +
+    scale_x_log10() +
+    labs(
+        title    = "ERBB2 RNA × HER2 protein spatial correlation vs bin size",
+        subtitle = "Where do transcript and protein signals agree?",
+        x        = "Hexagonal bin side length (μm, log scale)",
+        y        = "Correlation"
+    ) +
+    theme_minimal()
+
+ggsave(
+    filename = file.path(results_folder, "05-erbb2-her2-correlation-vs-binsize.png"),
+    plot     = p_corr,
+    width    = 8,
+    height   = 5,
+    dpi      = 300
+)
+
+# spatial overlay — HER2 intensity with ERBB2 transcripts on top ----------
+spatInSituPlotPoints(
+    xenium_gobj,
+    feats             = list(rna = "ERBB2"),
+    feats_color_code  = c(ERBB2 = "red"),
+    point_size        = 0.1,
+    show_image        = TRUE,
+    image_name        = "HER2",
+    polygon_feat_type = "cell",
+    polygon_alpha     = 0,
+    save_param = list(
+        save_name   = "05-erbb2-transcripts-on-her2-if",
+        base_width  = 14,
+        base_height = 10
+    )
+)
+
+# saving results ----------
+write_csv(
+    bivariate_results,
+    file.path(tables_folder, "05-erbb2-her2-bivariate.csv")
+)
+```
+
+-   Expected pattern: correlation rises with bin size up to some plateau (typically 50–200 μm for Xenium breast cancer), reflecting agreement between protein and mRNA at the scale of tumor substructures but divergence at single-cell resolution due to measurement noise and the translational time lag between transcription and protein accumulation
+-   Manuscript figure: the spatial overlay (HER2 IF grayscale underneath, ERBB2 transcripts as red points on top) plus the correlation-vs-binsize curve is a clean demonstration that the two modalities tell a consistent tumor-architecture story, and quantifies the appropriate scale at which that story holds
+
+## Analysis Summary
+
+After these sections the `xenium_gobj` object carries everything needed for a full breast cancer spatial story:
+
+-   **cell type labels** transferred from the paired scRNA-seq via Harmony + kNN
+-   **cell proximity enrichment** showing which cell types co-localise beyond chance
+-   **interaction-changed genes** revealing proximity-conditioned expression changes — the proximity-aware DE analysis unique to Giotto
+-   **multicellular niches** clustering cells by neighbourhood composition, producing interpretable regional identities
+-   **HMRF spatial domains** finding coherent transcriptional regions that map onto H&E-identifiable structures
+-   **bivariate HER2–ERBB2 analysis** demonstrating cross-modal agreement between protein and RNA in the same Giotto object
+
+Each analysis is checkpointed under `../checkpoints/` so any section can be re-run or rebuilt without recomputing the full pipeline. All figures are written to `../write/figures/` with explicit `save_name` parameters for reproducible file organisation.
+
+### Optional extensions worth considering
+
+-   **Spatial co-expression modules** (`detectSpatialCorFeats` → `clusterSpatialCorFeats` → `createMetafeats`) — cluster genes by spatial pattern similarity and visualise each module as a tissue-atlas-style metagene. Complements HMRF when you want gene-program-level detail rather than domain-level summaries
+-   **Subcellular transcript enrichment** — you have nucleus polygons, so you can ask which genes are nuclear-enriched vs cytoplasmic. The Xenium 313-gene panel is less suited to this than MERFISH whole-transcriptome data, but it's still a strong demonstration of a capability unique to Giotto among mainstream frameworks
+-   **Cell-cell communication via `spatCellCellcom`** — integrates the Delaunay network with cell-type labels for spatially-constrained ligand-receptor activity scoring, rather than the non-spatial CellChat-style output
+
+### Related packages for specific extensions
+
+-   **ONTraC** — trajectory inference in spatial context (Giotto plugin)
+-   **MISTy** — multi-view spatial modelling (Giotto plugin)
+-   **Bento** — more aggressive subcellular analysis when the gene panel supports it
+
+### Future work: cellpose3 segmentations
+
+-   The remaining open item from this pipeline is replacing the Xenium default nucleus-expansion polygons with cellpose3 segmentations derived from the post-Xenium H&E
+-   The mechanism is straightforward in Giotto — load cellpose polygons as a `giottoPolygon`, then rerun `calculateOverlapRaster()` and `overlapToMatrix()` against the transcript point cloud to produce a new count matrix
+-   Expected gain: cleaner cell-type assignments (fewer transcripts assigned to the wrong cell due to over-aggressive expansion around shared boundaries), which propagates into better CPE / ICG / niche signal

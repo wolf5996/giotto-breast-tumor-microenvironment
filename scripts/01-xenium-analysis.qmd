@@ -1,0 +1,625 @@
+---
+title: "01 — Xenium Spatial Transcriptomics"
+author: "Badran Elshenawy"
+date: today
+format:
+  html:
+    theme: darkly
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    self-contained: true
+    title-block-banner: true
+engine: knitr
+execute:
+  eval: false
+  warning: false
+  message: false
+---
+
+# Context
+
+- **Scope**: standalone Xenium FFPE Human Breast Cancer Rep1 processing — from raw 10X outs through to a clustered Giotto object carrying the post-Xenium H&E and 3-channel IF images
+- **Upstream**: dataset pulled from `https://cf.10xgenomics.com/samples/xenium/1.0.1/Xenium_FFPE_Human_Breast_Cancer_Rep1/Xenium_FFPE_Human_Breast_Cancer_Rep1_outs.zip`
+- **Reference walkthrough**: adapted from [giottosuite.com/articles/xenium_breast_cancer](https://giottosuite.com/articles/xenium_breast_cancer.html) — parameters and ordering follow the Giotto tutorial, with local modifications for image alignment and group conventions
+- **Downstream**: the saved Giotto object (`../checkpoints/01-xenium-gobj/`) feeds script `04-integration.qmd` for the joint harmony-integrated workflow
+
+## Conventions
+
+- **Checkpoint storage**: `saveGiotto()` / `loadGiotto()` are used throughout for Giotto objects
+  - `write_rds()` / `read_rds()` are unsafe here: Giotto objects contain pointer-based assets (`terra` raster images, arrow-backed transcripts) that do not re-hydrate correctly through `saveRDS`
+  - `saveGiotto()` writes a self-contained folder with each component serialised separately; `loadGiotto(..., reconnect_giottoImage = TRUE)` restores the image pointers against the on-disk TIFFs
+
+| Stage | Path | Method |
+|---|---|---|
+| Xenium processed (this script output) | `../checkpoints/01-xenium-gobj/` | `saveGiotto` |
+| scRNA-Seq Seurat (script 02 output) | `../checkpoints/02-sc-seu-annotated.rds` | `write_rds` |
+| scRNA-Seq Giotto annotated (script 03 output) | `../checkpoints/03-sc-giotto-annotated/` | `saveGiotto` |
+| Joined + Harmony + label transfer (script 04 output) | `../checkpoints/04-joined-giotto-harmony-annotated/` | `saveGiotto` |
+
+- **Figure output**: all plots go to `../write/figures/` with explicit `save_name`, `base_width`, and `base_height` set via `save_param`
+- **Figure prefix**: `01-xenium-*` for every figure produced here; downstream scripts use `02-`, `03-`, `04-`
+
+# Setup
+
+## Arrow Installation
+
+- **Purpose**: Giotto reads Xenium `transcripts.parquet` through `arrow`, which must have ZSTD compression support — 10X parquet files are ZSTD-compressed
+- **Check logic**: if `arrow` is missing or was built without ZSTD, reinstall from the Apache R-universe with `ARROW_WITH_ZSTD=ON`
+- **One-off**: this usually runs once per machine; after a successful build the check short-circuits
+
+```{r}
+#| label: arrow-install
+
+# Libraries ----------
+# (none needed — this chunk stays self-contained on base R)
+
+# Processing ----------
+has_arrow <- requireNamespace("arrow", quietly = TRUE)
+zstd <- TRUE
+if (has_arrow) {
+    zstd <- arrow::arrow_info()$capabilities[["zstd"]]
+}
+if (!has_arrow || !zstd) {
+    Sys.setenv(ARROW_WITH_ZSTD = "ON")
+    install.packages(
+        "arrow",
+        repos = c("https://apache.r-universe.dev"),
+        type = "source"
+    )
+}
+```
+
+## Python Environment and Giotto Instructions
+
+- **Python backend**: Giotto delegates image and IO work to Python via `reticulate` — `tifffile` handles OME-TIFF conversion, `imagecodecs` provides JPEG2000 decoding, `scrublet` / `leidenalg` / `python-igraph` cover dimensionality-reduction and clustering backends
+- **Env management**: this project uses `uv` (see `pyproject.toml`), not conda — `installGiottoEnvironment()` is intentionally not called because it would create a parallel conda env
+- **Pointing Giotto at the uv env**: `set_giotto_python_path(".venv/bin/python")` — must run before any Giotto operation that dispatches to Python
+- **Instructions object (`instrs`)**: centralises the save behaviour (plot directory, save/show/return flags, python path) so every Giotto plotting call inherits the same defaults
+
+```{r}
+#| label: setup-giotto
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+python_path <- ".venv/bin/python"
+set_giotto_python_path(python_path = python_path)
+
+results_folder <- "../write/figures/"
+
+instrs <- createGiottoInstructions(
+    save_dir = results_folder,
+    save_plot = TRUE,
+    show_plot = FALSE,
+    return_plot = FALSE,
+    python_path = python_path
+)
+```
+
+# Load Xenium Data
+
+- **Input**: the full unzipped Xenium bundle at `../read/outs/` — includes `cell_feature_matrix.h5`, `transcripts.parquet`, polygon parquet, and the `morphology*.ome.tif` stack
+- **`qv_threshold = 20`**: 10X's own default; filters transcripts whose per-read Phred-scaled quality value is below 20 (i.e. <99% confidence in decoding)
+- **Feature types and split keywords**: Xenium panels ship four feature categories; keeping them separate lets us inspect each in isolation during QC
+  - `rna` — real gene probes
+  - `UnassignedCodeword` — decoded codewords not assigned to a target (noise floor)
+  - `NegControlCodeword` — codewords without matching probes (decoding error rate)
+  - `NegControlProbe` + `antisense` — probes without target sequences (non-specific binding rate)
+- **Repo structure caveat**: `xeniumranger` versions newer than 1.0.1 reshuffle the `outs/` tree; adjust `xenium_dir` accordingly if upgrading
+
+```{r}
+#| label: load-xenium
+
+# Libraries ----------
+library(Giotto)
+
+# Inputs ----------
+data_path <- "../read/"
+
+# Processing ----------
+# Feature-type splits are specific to pre-release / early Xenium panels;
+# the 4 codeword categories isolate noise from true RNA signal.
+feat_types <- c(
+    "rna",
+    "UnassignedCodeword",
+    "NegControlCodeword",
+    "NegControlProbe"
+)
+split_keywords <- list(
+    c("BLANK"),
+    c("NegControlCodeword"),
+    c("NegControlProbe", "antisense")
+)
+
+xenium_gobj <- createGiottoXeniumObject(
+    xenium_dir = file.path(data_path, "outs"),
+    qv_threshold = 20,
+    feat_type = feat_types,
+    split_keyword = split_keywords,
+    # Aligned images are attached in a later chunk (see "Post-Xenium Aligned Images")
+    # rather than passed here, to keep the conversion step visible and auditable.
+    instructions = instrs
+)
+
+force(xenium_gobj)
+```
+
+# Initial Visualisation
+
+- **Overview plot**: a flat scatter of all cell centroids — confirms the tissue footprint loaded correctly and the coordinate frame is sane (Xenium uses a negative-y convention)
+- **Zoomed region**: a 1000×1000 µm window with polygon overlays on the morphology image — confirms cell segmentation boundaries align with the DAPI channel
+  - `xlim = c(1000, 2000)` / `ylim = c(-3000, -2000)` was chosen to land on a region with mixed tumour/stromal morphology for visual QC
+
+```{r}
+#| label: initial-viz
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+# Full-field centroid overview — no polygons, no image; fastest sanity check.
+spatPlot2D(
+    xenium_gobj,
+    point_shape = "no_border",
+    point_size = 1,
+    save_param = list(
+        save_name = "01-xenium-overview-spatial",
+        base_width = 10,
+        base_height = 8
+    )
+)
+
+# Zoomed view with polygon outlines on the morphology image — checks segmentation
+# quality against the underlying DAPI signal.
+spatInSituPlotPoints(
+    xenium_gobj,
+    show_image = TRUE,
+    polygon_line_size = 0.1,
+    polygon_color = "#BB0000",
+    polygon_alpha = 0.2,
+    xlim = c(1000, 2000),
+    ylim = c(-3000, -2000),
+    save_param = list(
+        save_name = "01-xenium-zoomed-polygons-overview",
+        base_width = 8,
+        base_height = 8
+    )
+)
+```
+
+# Post-Xenium Aligned Images
+
+- **Group motivation**: our in-house liver workflow produces high-quality post-Xenium segmentation via `cellpose3`; testing that those polygons can drive the Giotto count matrix is an open question this project is scaffolding toward
+- **This dataset**: the 10X breast-cancer sample ships post-Xenium H&E and a 3-channel IF (DAPI / HER2 / CD20) with per-image alignment CSVs produced by Xenium Explorer
+- **Why convert OME-TIFF → TIFF**: Giotto reads flat `.tif` natively via `terra`; `.ome.tif` metadata has to be parsed through Python `tifffile`, which introduces a noticeable speed penalty at every access — converting up front trades one cost for many
+
+## Converting OME-TIFF
+
+- **`GiottoClass::ometif_to_tif()`**: uses Python `tifffile` / `imagecodecs` as the backend; writes flat TIFFs to `read/tif_exports/` by default
+- **Multi-page IF**: the IF OME-TIFF is a 3-page stack (one page per channel) — each page is converted separately with `page = p`
+- **`ometif_metadata(..., node = "Channel")$Name`**: pulls the channel names (DAPI, HER2, CD20) from the OME-TIFF XML so we can name the resulting Giotto images correctly
+
+```{r}
+#| label: convert-ome-tiff
+
+# Libraries ----------
+library(Giotto)
+library(purrr)
+
+# Inputs ----------
+path_he <- "../read/Xenium_FFPE_Human_Breast_Cancer_Rep1_he_image.ome.tif"
+path_if <- "../read/Xenium_FFPE_Human_Breast_Cancer_Rep1_if_image.ome.tif"
+
+# Processing ----------
+# H&E — single-page; converts to read/tif_exports/<basename>.tif by default.
+conv_path_he <- GiottoClass::ometif_to_tif(path_he)
+
+# IF — 3-page stack (DAPI / HER2 / CD20); convert each page separately.
+conv_path_if <- map(1:3, function(p) {
+    GiottoClass::ometif_to_tif(
+        path_if,
+        page = p,
+        overwrite = TRUE
+    )
+})
+
+# Pull channel names from the OME-TIFF XML metadata so the attached Giotto images
+# inherit biologically meaningful names rather than "page_1", "page_2", etc.
+if_channels <- GiottoClass::ometif_metadata(path_if, node = "Channel")$Name
+```
+
+## Loading Aligned Images
+
+- **`importXenium()`**: Giotto helper that returns a list of loaders tied to an outs directory
+- **`load_aligned_image()`**: reads the flat TIFF and applies the affine transform from the per-image `imagealignment.csv` (produced by Xenium Explorer) to place the image in the Xenium coordinate frame
+- **Per-channel treatment**: each IF channel is loaded as a separate Giotto image named after the stain (DAPI, HER2, CD20), enabling channel-specific overlay in later plots
+
+```{r}
+#| label: load-aligned-images
+
+# Libraries ----------
+library(Giotto)
+
+# Inputs ----------
+data_path <- "../read/"
+
+# Processing ----------
+x <- importXenium(file.path(data_path, "outs"))
+
+# H&E — one image, one alignment file.
+img_he <- x$load_aligned_image(
+    name = "post_he",
+    path = conv_path_he,
+    imagealignment_path = "../read/Xenium_FFPE_Human_Breast_Cancer_Rep1_he_imagealignment.csv"
+)
+
+# IF — iterate over the 3 channels; all share the same alignment CSV.
+img_if <- lapply(1:3, function(if_i) {
+    x$load_aligned_image(
+        name = if_channels[[if_i]],
+        path = conv_path_if[[if_i]],
+        imagealignment_path = "../read/Xenium_FFPE_Human_Breast_Cancer_Rep1_if_imagealignment.csv"
+    )
+})
+```
+
+## Appending Images to the Giotto Object
+
+- **Cells and transcripts still come from Xenium**: attaching these images does not alter the segmentation or count matrix; they are overlay assets for visualisation and for any future workflow that uses them to drive segmentation
+- **Open question**: whether polygons produced from an external image (e.g. `cellpose3` on the H&E) can replace the Xenium-provided `cell_boundaries` and then be used via `calculateOverlapRaster` to build an alternative count matrix — not validated here, flagged for follow-up
+
+```{r}
+#| label: attach-images
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+xenium_gobj <- setGiotto(
+    xenium_gobj,
+    c(
+        list(img_he),
+        img_if
+    )
+)
+
+# Confirm the image slots were populated with the expected names.
+print(names(xenium_gobj@images))
+
+# Visual check: HER2-overlaid polygons in the same zoomed region used earlier.
+# HER2 is a clinically actionable receptor (amplified in ~15-20% of breast cancers);
+# its IF signal should localise to epithelial/cancer cell polygons.
+spatInSituPlotPoints(
+    xenium_gobj,
+    xlim = c(1000, 2000),
+    ylim = c(-3000, -2000),
+    show_image = TRUE,
+    image_name = "HER2",
+    polygon_line_size = 0.1,
+    polygon_color = "#BB0000",
+    polygon_alpha = 0.2,
+    save_param = list(
+        save_name = "01-xenium-zoomed-polygons-her2",
+        base_width = 8,
+        base_height = 8
+    )
+)
+
+# DAPI overlay for the same region — nuclear counterstain, should fill every polygon.
+spatInSituPlotPoints(
+    xenium_gobj,
+    xlim = c(1000, 2000),
+    ylim = c(-3000, -2000),
+    show_image = TRUE,
+    image_name = "dapi",
+    polygon_line_size = 0.1,
+    polygon_color = "blue",
+    polygon_alpha = 0.2,
+    save_param = list(
+        save_name = "01-xenium-zoomed-polygons-dapi",
+        base_width = 8,
+        base_height = 8
+    )
+)
+```
+
+# Data Aggregation
+
+- **Step**: convert the point-cloud of decoded transcripts + polygon boundaries into a cell × gene count matrix
+- **`calculateOverlapRaster`**: intersects `rna` transcript points with `cell` polygons using a raster-based algorithm — faster than vector-polygon intersection for dense point clouds
+- **`overlapToMatrix`**: collapses the intersection records into a sparse count matrix stored under `expression$raw`; this matrix is what downstream filtration, normalisation, and clustering operate on
+
+```{r}
+#| label: data-aggregation
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+# Raster-based overlap: bin transcripts into the raster, then assign to polygons.
+xenium_gobj <- calculateOverlapRaster(
+    gobject = xenium_gobj,
+    spatial_info = "cell",
+    feat_info = "rna"
+)
+
+# Collapse overlap records into a sparse cell × gene count matrix.
+xenium_gobj <- overlapToMatrix(
+    xenium_gobj,
+    poly_info = "cell",
+    feat_info = "rna",
+    name = "raw"
+)
+
+showGiottoExpression(xenium_gobj)
+```
+
+# Filtration, Normalisation, and Dimensionality Reduction
+
+- **Filtration thresholds** (follow the Giotto tutorial defaults):
+  - `expression_threshold = 1`: a feature counts as detected if ≥1 transcript is assigned to the cell
+  - `feat_det_in_min_cells = 3`: drop genes detected in fewer than 3 cells — removes genes with no population-level signal
+  - `min_det_feats_per_cell = 5`: drop cells expressing fewer than 5 genes — removes empty or blank polygons
+- **Normalisation**: Giotto's default is library-size normalisation + log-transform + per-cell scaling — adequate for Xenium's ~300-gene panel where SCT-style variance stabilisation is overkill
+- **`addStatistics()`**: computes per-cell and per-gene summary stats needed by downstream plotting
+- **PCA on all features (`feats_to_use = NULL`)**: targeted panels are small enough to PCA without HVF selection; using all genes avoids arbitrarily throwing away panel content
+
+```{r}
+#| label: filter-normalise-pca
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+xenium_gobj <- xenium_gobj |>
+    filterGiotto(
+        spat_unit = "cell",
+        expression_threshold = 1,
+        feat_det_in_min_cells = 3,
+        min_det_feats_per_cell = 5
+    ) |>
+    normalizeGiotto() |>
+    addStatistics() |>
+    runPCA(feats_to_use = NULL)
+
+# Scree plot — inspect the PCA eigenvalue elbow to pick `dimensions_to_use`.
+screePlot(
+    xenium_gobj,
+    ncp = 20,
+    save_param = list(
+        save_name = "01-xenium-scree-plot",
+        base_width = 7,
+        base_height = 5
+    )
+)
+
+# First two PCs — quick visual check that PCA captured population structure.
+plotPCA(
+    xenium_gobj,
+    point_size = 0.1,
+    save_param = list(
+        save_name = "01-xenium-pca",
+        base_width = 7,
+        base_height = 6
+    )
+)
+```
+
+| Parameter | Value | Justification |
+|---|---|---|
+| `expression_threshold` | 1 | Single transcript is sufficient evidence for detection at Xenium sensitivity |
+| `feat_det_in_min_cells` | 3 | Removes genes with no population-level signal without dropping rare markers |
+| `min_det_feats_per_cell` | 5 | Removes empty polygons / decoding failures |
+| `feats_to_use` (PCA) | NULL (all genes) | Targeted panel of ~300 genes — no need for HVF pre-selection |
+
+## Further Dimensional Reduction
+
+- **`dimensions_to_use = 1:10`**: a conservative default that works well for the breast cancer panel; the scree plot above should be consulted before changing it
+- **Running both tSNE and UMAP**: UMAP preserves global structure better, tSNE preserves local neighbourhoods — looking at both is a cheap sanity check for embedding stability
+
+```{r}
+#| label: umap-tsne
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+xenium_gobj <- runtSNE(xenium_gobj, dimensions_to_use = 1:10)
+xenium_gobj <- runUMAP(xenium_gobj, dimensions_to_use = 1:10)
+
+plotTSNE(
+    xenium_gobj,
+    point_size = 0.01,
+    save_param = list(
+        save_name = "01-xenium-tsne",
+        base_width = 7,
+        base_height = 6
+    )
+)
+
+plotUMAP(
+    xenium_gobj,
+    point_size = 0.01,
+    save_param = list(
+        save_name = "01-xenium-umap",
+        base_width = 7,
+        base_height = 6
+    )
+)
+```
+
+# Clustering
+
+- **Graph-based clustering**: Giotto follows the standard scRNA-Seq recipe — build a kNN graph on the PCA embedding, then run Leiden on the graph
+- **`k = 10`**: neighbourhood size for the kNN graph; small enough to preserve fine structure, large enough to connect most cells
+- **`resolution = 0.25`**: chosen to yield ~8–12 coarse populations — suits the 298-gene panel, which cannot resolve fine subtypes regardless
+- **`n_iterations = 100`**: Leiden optimisation iterations; default in Giotto, robust to the parameter
+
+```{r}
+#| label: leiden-clustering
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+xenium_gobj <- xenium_gobj |>
+    createNearestNetwork(
+        dimensions_to_use = 1:10,
+        k = 10
+    ) |>
+    doLeidenCluster(
+        resolution = 0.25,
+        n_iterations = 100
+    )
+
+plotTSNE(
+    xenium_gobj,
+    cell_color = "leiden_clus",
+    show_legend = FALSE,
+    point_size = 0.01,
+    point_shape = "no_border",
+    save_param = list(
+        save_name = "01-xenium-tsne-leiden-clusters",
+        base_width = 7,
+        base_height = 6
+    )
+)
+
+plotUMAP(
+    xenium_gobj,
+    cell_color = "leiden_clus",
+    show_legend = FALSE,
+    point_size = 0.01,
+    point_shape = "no_border",
+    save_param = list(
+        save_name = "01-xenium-umap-leiden-clusters",
+        base_width = 7,
+        base_height = 6
+    )
+)
+```
+
+# Spatial Visualisation with Clusters
+
+- **Centroid plot with DAPI backdrop**: Leiden clusters coloured onto their spatial positions with the DAPI IF image as the background — reveals whether clusters correspond to tissue-level spatial domains or mix uniformly
+- **`plot_method = "scattermore"`**: GPU-accelerated scatter backend; essential for rendering hundreds of thousands of points without choking
+- **Polygon plot**: the same clustering rendered as filled cell polygons instead of centroids — preserves cell morphology at the cost of being much slower to render
+
+```{r}
+#| label: spatial-viz-clusters
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+spatPlot2D(
+    xenium_gobj,
+    plot_method = "scattermore",
+    cell_color = "leiden_clus",
+    point_size = 0.5,
+    point_shape = "no_border",
+    image = "DAPI",
+    background_color = "black",
+    save_param = list(
+        save_name = "01-xenium-spatial-leiden-clusters",
+        base_width = 10,
+        base_height = 8
+    )
+)
+
+# Polygon rendering — biologically more informative (cell shape is preserved),
+# but noticeably slower than centroid scattering for dense fields.
+spatInSituPlotPoints(
+    xenium_gobj,
+    polygon_feat_type = "cell",
+    polygon_alpha = 1,
+    polygon_line_size = 0.01,
+    polygon_color = "black",
+    polygon_fill = "leiden_clus",
+    polygon_fill_as_factor = TRUE,
+    save_param = list(
+        save_name = "01-xenium-polygons-leiden-clusters",
+        base_width = 10,
+        base_height = 10
+    )
+)
+```
+
+# Marker Gene Visualisation
+
+- **Purpose**: confirm that the clustering has captured the expected breast-tumour-microenvironment populations before committing to any annotation
+- **Panel**: curated lineage markers covering the populations expected in FFPE breast cancer — lymphoid, myeloid, stromal, vascular, and epithelial/cancer compartments
+- **Marker choices** (grouped by compartment):
+  - **T cells**: `CD3E` (pan-T), `CD8A` (cytotoxic), `CD4` (helper)
+  - **B lineage**: `MS4A1` (CD20, mature B), `JCHAIN` (plasmablast / antibody-secreting cell)
+  - **Cancer-associated fibroblasts**: `DCN`, `SFRP2` (mesenchymal CAFs), `TAGLN` (contractile CAF / perivascular-like)
+  - **Endothelium**: `RAMP2` (blood endothelial), `PROX1` (lymphatic endothelial)
+  - **Myeloid**: `TYROBP` (DAP12 adaptor, pan-myeloid)
+  - **Mast cells**: `CPA3`, `TPSAB1` (granule proteases)
+  - **Epithelial / cancer**: `KRT8` (luminal keratin), `MKI67` (proliferation), `SPINT2` (epithelial serine-protease inhibitor), `CD24` (also a breast cancer stemness marker)
+  - **Myoepithelial / basal**: `SOX10`, `TP63`
+  - **Checkpoint**: `PDCD1` (PD-1 — immune exhaustion / ICI target)
+
+```{r}
+#| label: marker-genes
+
+# Libraries ----------
+library(Giotto)
+
+# Processing ----------
+dimFeatPlot2D(
+    xenium_gobj,
+    feats = c(
+        "CD3E", "CD8A", "CD4",        # T cell (pan, cytotoxic, helper)
+        "JCHAIN",                      # plasmablast
+        "MS4A1",                       # B (CD20)
+        "DCN", "SFRP2",                # CAF (mesenchymal)
+        "TAGLN",                       # CAF / PVL (contractile)
+        "RAMP2",                       # blood endothelial
+        "PROX1",                       # lymphatic endothelial
+        "TYROBP",                      # myeloid (DAP12)
+        "CPA3", "TPSAB1",              # mast cell
+        "SPINT2", "MKI67", "KRT8",     # epithelial / cancer (proliferation + keratin)
+        "SOX10", "TP63",               # myoepithelial / basal
+        "CD24",                        # B cell + cancer stemness
+        "PDCD1"                        # PD-1 (T cell exhaustion / ICI target)
+    ),
+    point_size = 0.2,
+    point_border_stroke = 0,
+    background_color = "black",
+    cow_n_col = 4,
+    show_legend = FALSE,
+    gradient_style = "sequential",
+    save_param = list(
+        save_name = "01-xenium-marker-genes",
+        base_width = 14,
+        base_height = 16
+    )
+)
+```
+
+# Save Checkpoint
+
+- **`saveGiotto()` over `write_rds()`**: mandatory for Giotto objects — the attached post-Xenium H&E and IF images are `terra` raster pointers, and arrow-backed transcript tables are also pointer-based; `write_rds` silently produces a reloadable-but-broken object
+- **Folder layout**: `saveGiotto` writes a directory (`foldername`) containing one serialised component per Giotto slot plus an image subfolder with the re-connectable TIFF paths
+- **Reload**: downstream scripts use `loadGiotto("../checkpoints/01-xenium-gobj", reconnect_giottoImage = TRUE, python_path = ".venv/bin/python")` to re-hydrate the object with image pointers intact
+- **Caveat**: `reconnect_giottoImage = TRUE` assumes the `read/tif_exports/` TIFFs have not moved — if the project is relocated, re-run the "Converting OME-TIFF" chunk before reloading
+
+```{r}
+#| label: save-checkpoint
+
+# Libraries ----------
+library(Giotto)
+
+# Outputs ----------
+saveGiotto(
+    gobject = xenium_gobj,
+    dir = "../checkpoints",
+    foldername = "01-xenium-gobj",
+    method = "saveRDS"
+)
+```
